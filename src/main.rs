@@ -7,15 +7,19 @@ use clap::Parser;
 use indoc::{formatdoc, indoc};
 use std::{collections::HashMap, fs, path::PathBuf, str::FromStr};
 
-/// Simple program to greet a person
+/// A program for tracking scores while playing rocket league and publishing the running tally to discord.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Number of times to greet
+    /// Location to look for replays.
     #[arg(short, long)]
     location: Option<PathBuf>,
+    /// The webhook API link from Discord channel integrations.
     #[arg(short, long)]
-    webhook: String,
+    webhook: Option<String>,
+    /// Run without discord and print messages to stdout.
+    #[arg(short, long)]
+    no_discord: bool,
 }
 
 #[derive(Debug)]
@@ -27,6 +31,8 @@ struct Tally {
 #[derive(Debug)]
 struct PlayerStats {
     times_seen: usize,
+    wins: usize,
+    losses: usize,
     score: (usize, usize),
     goals: (usize, usize),
     assists: (usize, usize),
@@ -40,7 +46,13 @@ const BOT_NAME: &str = "Rocket League Session";
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let client: WebhookClient = WebhookClient::new(&args.webhook);
+    if args.webhook.is_none() && !args.no_discord {
+        return Err(anyhow!(
+            "You must either provide a webhook with --webhook or run with --no-discord"
+        ));
+    }
+
+    let client: WebhookClient = WebhookClient::new(&args.webhook.unwrap_or_default());
 
     let Some(location) = args.location.or_else(|| PathBuf::from_str(&format!(r"C:\Users\{}\AppData\Roaming\bakkesmod\bakkesmod\data\replays", whoami::username())).ok()) else {
         return Err(anyhow!("Location was not valid and default location did not work. Please supply a path to the replay folder"));
@@ -65,16 +77,19 @@ async fn main() -> Result<()> {
         games_played: 0,
     };
 
-    let _res = client.send(|message| {
-        message.username(BOT_NAME).embed(|embed| {
-            embed
-                .title("Starting new session")
-                .description(indoc! {
-                    "The bot will try to single out the people that plays multiple times in the session, on either team.
-                    Please make sure to install Bakkesmod and make _Auto replay uploader_ do export to the filepath specified by you or the program.
-                "})
-        })
-    }).await;
+    if !args.no_discord {
+        let _res = client.send(|message| {
+            message.username(BOT_NAME).embed(|embed| {
+                embed
+                    .title("Starting new session")
+                    .description(indoc! {
+                        "The bot will try to single out the people that plays multiple times in the session, on either team.
+                        Please make sure to install Bakkesmod and make _Auto replay uploader_ do export to the filepath specified by you or the program.
+                        Stats are in the form: accumulated (last game)
+                    "})
+            })
+        }).await;
+    }
 
     let mut current_file: Option<PathBuf> = None;
     for e in rx {
@@ -131,6 +146,26 @@ async fn main() -> Result<()> {
                         continue;
                     };
 
+                    let team0_score = replay
+                        .properties
+                        .iter()
+                        .find(|(s, _)| s == "Team0Score")
+                        .map(|(_, v)| v.as_i32().unwrap_or_default())
+                        .unwrap_or_default();
+                    let team1_score = replay
+                        .properties
+                        .iter()
+                        .find(|(s, _)| s == "Team1Score")
+                        .map(|(_, v)| v.as_i32().unwrap_or_default())
+                        .unwrap_or_default();
+                    let team_win_lose = if team0_score == team1_score {
+                        (2, 2)
+                    } else if team0_score > team1_score {
+                        (0, 1)
+                    } else {
+                        (1, 0)
+                    };
+
                     // Accumulate stats
                     for player_stat in stats {
                         let mut name: Option<String> = None;
@@ -139,6 +174,7 @@ async fn main() -> Result<()> {
                         let mut assists: usize = 0;
                         let mut saves: usize = 0;
                         let mut shots: usize = 0;
+                        let mut team: usize = 0;
                         for (key, prop) in player_stat {
                             match (key.as_str(), prop) {
                                 ("Name", HeaderProp::Str(v)) => name = Some(v.to_string()),
@@ -147,14 +183,21 @@ async fn main() -> Result<()> {
                                 ("Assists", HeaderProp::Int(v)) => assists = *v as usize,
                                 ("Saves", HeaderProp::Int(v)) => saves = *v as usize,
                                 ("Shots", HeaderProp::Int(v)) => shots = *v as usize,
+                                ("Team", HeaderProp::Int(v)) => team = *v as usize,
                                 _ => {}
                             }
                         }
+
+                        let did_win = team == team_win_lose.0 as usize;
+                        let did_lose = team == team_win_lose.1;
+
                         if let Some(name) = name {
                             let stats = tally.player_stats.entry(name);
                             stats
                                 .and_modify(|stats| {
                                     stats.times_seen += 1;
+                                    stats.wins += did_win as usize;
+                                    stats.losses += did_lose as usize;
                                     stats.score = (stats.score.0 + score, score);
                                     stats.goals = (stats.goals.0 + goals, goals);
                                     stats.assists = (stats.assists.0 + assists, assists);
@@ -168,6 +211,8 @@ async fn main() -> Result<()> {
                                     assists: (assists, assists),
                                     saves: (saves, saves),
                                     shots: (shots, shots),
+                                    wins: did_win as usize,
+                                    losses: did_lose as usize,
                                 });
                         }
                     }
@@ -193,10 +238,13 @@ async fn main() -> Result<()> {
                             assists,
                             saves,
                             shots,
+                            wins,
+                            losses,
                         } = stats;
                         let player_msg = formatdoc! {"
                             ### {name}
                             *Played {times_seen} games*
+                            - Wins/Losses: {wins}/{losses}
                             - Score: {score_tally} ({score})
                             - Goals: {goals_tally} ({goals})
                             - Assists: {assists_tally} ({assists})
@@ -205,6 +253,8 @@ async fn main() -> Result<()> {
                         ",
                         name=name,
                         times_seen=times_seen,
+                        wins=wins,
+                        losses=losses,
                         score_tally=score.0,
                         score=score.1,
                         goals_tally=goals.0,
@@ -220,18 +270,22 @@ async fn main() -> Result<()> {
                         // stat_message.push_str("\n");
                     }
 
-                    let res = client
-                        .send(|message| {
-                            message
-                                .username(BOT_NAME)
-                                .embed(|embed| embed.description(&stat_message))
-                        })
-                        .await;
-                    if res.is_err() {
-                        eprintln!("Failed to send message to discord webhook");
-                        continue;
-                    };
-                    eprintln!("Sent stats to discord\n");
+                    if !args.no_discord {
+                        let res = client
+                            .send(|message| {
+                                message
+                                    .username(BOT_NAME)
+                                    .embed(|embed| embed.description(&stat_message))
+                            })
+                            .await;
+                        if res.is_err() {
+                            eprintln!("Failed to send message to discord webhook");
+                            continue;
+                        };
+                        eprintln!("Sent stats to discord\n");
+                    } else {
+                        print!("{}", stat_message);
+                    }
                 }
             }
             Err(e) => {
